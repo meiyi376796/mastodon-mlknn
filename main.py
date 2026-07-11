@@ -1,11 +1,11 @@
 """Pipeline entry point for the Mastodon multi-label classification workflow."""
 
 import os
-import sys
 import pickle
+import sys
 
 from config import (
-    DATA_DIR, DATASET1_TOPICS, DATASET2_TOPICS, METRIC_LABELS, METRIC_ORDER,
+    DATA_DIR, DATASETS, METRIC_LABELS, METRIC_ORDER,
     K_NEIGHBORS, SMOOTHING_FACTOR, LDA_TOPICS, GRAPH_EMB_DIM, PROFILE_DIM,
 )
 from logger import Logger
@@ -15,46 +15,54 @@ log = Logger("pipeline")
 
 def step1_fetch_data():
     from data_fetcher import collect_data
-    collect_data(DATASET1_TOPICS, "dataset1")
-    collect_data(DATASET2_TOPICS, "dataset2")
+    for ds, topics in DATASETS:
+        collect_data(topics, ds)
 
 
-def step2_build_network():
-    from network_builder import build_network
-    for ds, topics in [("dataset1", DATASET1_TOPICS), ("dataset2", DATASET2_TOPICS)]:
+def _run_for_dataset(callback, load_network=False):
+    """Load data (and network if requested) for each dataset and invoke callback."""
+    for ds, topics in DATASETS:
         data_path = os.path.join(DATA_DIR, f"{ds}.pkl")
-        if not os.path.exists(data_path):
-            log.skip(f"{data_path} not found")
-            continue
-        with open(data_path, "rb") as f:
-            data = pickle.load(f)
-        build_network(data, topics, ds)
-
-
-def step3_extract_features():
-    from feature_extractor import extract_all_features
-    for ds, topics in [("dataset1", DATASET1_TOPICS), ("dataset2", DATASET2_TOPICS)]:
-        data_path = os.path.join(DATA_DIR, f"{ds}.pkl")
-        net_path = os.path.join(DATA_DIR, f"{ds}_network.pkl")
-        if not os.path.exists(data_path) or not os.path.exists(net_path):
-            missing = []
-            if not os.path.exists(data_path):
-                missing.append(data_path)
-            if not os.path.exists(net_path):
-                missing.append(net_path)
+        required_paths = [data_path]
+        network = None
+        net_path = ""
+        if load_network:
+            net_path = os.path.join(DATA_DIR, f"{ds}_network.pkl")
+            required_paths.append(net_path)
+        missing = [p for p in required_paths if not os.path.exists(p)]
+        if missing:
             log.skip(f"{', '.join(missing)} not found")
             continue
         with open(data_path, "rb") as f:
             data = pickle.load(f)
-        with open(net_path, "rb") as f:
-            network = pickle.load(f)
+        if load_network:
+            with open(net_path, "rb") as f:
+                network = pickle.load(f)
+        callback(data, network, topics, ds)
+
+
+def step2_build_network():
+    from network_builder import build_network
+
+    def _on_dataset(data, _network, topics, ds):
+        build_network(data, topics, ds)
+
+    _run_for_dataset(_on_dataset, load_network=False)
+
+
+def step3_extract_features():
+    from feature_extractor import extract_all_features
+
+    def _on_dataset(data, network, topics, ds):
         extract_all_features(data, network, topics, ds)
+
+    _run_for_dataset(_on_dataset, load_network=True)
 
 
 def step4_train_evaluate():
     from ml_knn import run_experiment, run_nested_cv
     results = {}
-    for ds in ["dataset1", "dataset2"]:
+    for ds, _ in DATASETS:
         feat_path = os.path.join(DATA_DIR, f"{ds}_features.npz")
         if not os.path.exists(feat_path):
             log.skip(f"{feat_path} not found")
@@ -70,7 +78,7 @@ def step4_train_evaluate():
         log.warn("TRAIN · no features available")
         return results
 
-    log.section("RESULTS")
+    log.header("RESULTS")
     log.info(f"{'Metric':20s} {'Dataset1':>10s} {'Dataset2':>10s}")
 
     for metric in METRIC_ORDER:
@@ -84,7 +92,7 @@ def step4_train_evaluate():
 def main():
     """Run every stage by default, or selected stages from CLI arguments."""
     import time
-    t0 = time.time()
+    start_time = time.time()
 
     log.header()
     log.info(f"args · {' '.join(sys.argv[1:]) if sys.argv[1:] else 'all'}")
@@ -99,21 +107,21 @@ def main():
     run_all = "all" in steps
 
     if run_all or "fetch" in steps:
-        log.section("FETCH")
+        log.header("FETCH")
         log.info("starting …")
         step1_fetch_data()
     else:
         log.info("FETCH · skipped")
 
     if run_all or "network" in steps:
-        log.section("NETWORK")
+        log.header("NETWORK")
         log.info("starting …")
         step2_build_network()
     else:
         log.info("NETWORK · skipped")
 
     if run_all or "features" in steps:
-        log.section("FEATURES")
+        log.header("FEATURES")
         log.info("starting …")
         step3_extract_features()
     else:
@@ -121,14 +129,14 @@ def main():
 
     trained = False
     if run_all or "train" in steps:
-        log.section("TRAIN")
+        log.header("TRAIN")
         log.info("starting …")
         results = step4_train_evaluate()
         trained = bool(results)
     else:
         log.info("TRAIN · skipped")
 
-    elapsed = time.time() - t0
+    elapsed = time.time() - start_time
     if (run_all or "train" in steps) and not trained:
         log.warn("pipeline · no results produced")
         sys.exit(1)

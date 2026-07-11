@@ -1,9 +1,9 @@
 """ML-KNN training and evaluation utilities for multi-label classification."""
 
-import os
 import json
-import time
+import os
 import pickle
+import time
 import warnings
 
 import numpy as np
@@ -17,6 +17,7 @@ from config import (
     DATA_DIR, RESULTS_DIR, METRIC_ORDER,
     N_OUTER_CV, N_INNER_CV,
     USER_REL_DIM, ENTITY_REL_DIM,
+    DATASETS,
 )
 from logger import Logger
 
@@ -34,15 +35,29 @@ def _powerset_labels(y: np.ndarray) -> np.ndarray:
     return y.dot(1 << np.arange(y.shape[1]))
 
 
-def _stratified_kfold_splits(n_splits, X, y, shuffle=True, random_state=None):
+def _stratified_kfold_splits(n_splits, x, y, shuffle=True, random_state=None) -> list[tuple[np.ndarray, np.ndarray]]:
     """Multi-label stratified KFold splits with fallback to ordinary KFold."""
     powerset = _powerset_labels(y)
     try:
         skf = StratifiedKFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
-        return list(skf.split(X, powerset))
+        return list(skf.split(x, powerset))
     except ValueError:
         kf = KFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
-        return list(kf.split(X))
+        return list(kf.split(x))
+
+
+def _stratified_train_test_split(y: np.ndarray, test_size: float = 0.3):
+    """Split row indices stratified by powerset labels, with a plain-split fallback."""
+    idx_all = np.arange(y.shape[0])
+    try:
+        return train_test_split(
+            idx_all, test_size=test_size, random_state=RANDOM_SEED,
+            stratify=_powerset_labels(y),
+        )
+    except ValueError:
+        return train_test_split(
+            idx_all, test_size=test_size, random_state=RANDOM_SEED,
+        )
 
 
 class MLKNN:
@@ -52,13 +67,16 @@ class MLKNN:
         self.k = k
         self.s = s
         self._fitted = False
-        self.prior_1: np.ndarray = None
-        self.prior_0: np.ndarray = None
-        self.posterior_1: np.ndarray = None
-        self.posterior_0: np.ndarray = None
+        self.prior_1: np.ndarray | None = None
+        self.prior_0: np.ndarray | None = None
+        self.posterior_1: np.ndarray | None = None
+        self.posterior_0: np.ndarray | None = None
+        self._X_train: np.ndarray | None = None
+        self._y_train: np.ndarray | None = None
+        self._effective_k: int | None = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray,
-            label_confidence: np.ndarray = None):
+    def fit(self, x_train: np.ndarray, y_train: np.ndarray,
+            label_confidence: np.ndarray | None = None):
         """Estimate label priors and neighbor-count posteriors from training data."""
         n_samples, n_labels = y_train.shape
         effective_k = max(1, min(self.k, n_samples - 1))
@@ -75,12 +93,12 @@ class MLKNN:
         self.prior_0 = 1.0 - self.prior_1
 
         # For each label, count how many of a sample's k neighbors have that label.
-        distances = cosine_distances(X_train)
+        distances = cosine_distances(x_train)
         np.fill_diagonal(distances, np.inf)
         k_nearest = np.argpartition(distances, effective_k, axis=1)[:, :effective_k]
 
-        self.posterior_1 = np.zeros((n_labels, effective_k + 1))
-        self.posterior_0 = np.zeros((n_labels, effective_k + 1))
+        posterior_1 = np.zeros((n_labels, effective_k + 1))
+        posterior_0 = np.zeros((n_labels, effective_k + 1))
 
         for l in range(n_labels):
             c = np.zeros(effective_k + 1)
@@ -99,27 +117,30 @@ class MLKNN:
                     c_prime[delta] += 1.0
 
             # Laplace smoothing prevents zero-probability decisions at prediction.
-            self.posterior_1[l] = (self.s + c) / (self.s * (effective_k + 1) + c.sum())
-            self.posterior_0[l] = (self.s + c_prime) / (self.s * (effective_k + 1) + c_prime.sum())
+            posterior_1[l] = (self.s + c) / (self.s * (effective_k + 1) + c.sum())
+            posterior_0[l] = (self.s + c_prime) / (self.s * (effective_k + 1) + c_prime.sum())
 
-        self._X_train = X_train
+        self.posterior_1 = posterior_1
+        self.posterior_0 = posterior_0
+
+        self._X_train = x_train
         self._y_train = y_train
         self._effective_k = effective_k
         self._fitted = True
 
-    def predict(self, X_test: np.ndarray) -> np.ndarray:
+    def predict(self, x_test: np.ndarray) -> np.ndarray:
         """Predict each label independently from neighbor-count likelihoods."""
         if not self._fitted:
             raise RuntimeError("Model not fitted")
 
-        n_test = X_test.shape[0]
+        n_test = x_test.shape[0]
         n_labels = len(self.prior_1)
         n_train = self._X_train.shape[0]
         effective_k = min(self._effective_k, n_train - 1)
         effective_k = max(1, effective_k)
         y_pred = np.zeros((n_test, n_labels), dtype=np.int32)
 
-        distances = cosine_distances(X_test, self._X_train)
+        distances = cosine_distances(x_test, self._X_train)
         k_nearest = np.argpartition(distances, effective_k, axis=1)[:, :effective_k]
 
         for t in range(n_test):
@@ -172,20 +193,21 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray, average: str = "sample") ->
     return {name: metrics[name] for name in METRIC_ORDER}
 
 
-def select_features_mi(X_train, y_train, n_select=80):
+def select_features_mi(x_train: np.ndarray, y_train: np.ndarray, n_select: int = 80):
     """Select features with the largest summed mutual information over labels."""
-    if X_train.shape[1] <= n_select:
-        return np.arange(X_train.shape[1])
-    mi_scores = np.zeros(X_train.shape[1])
+    if x_train.shape[1] <= n_select:
+        return np.arange(x_train.shape[1])
+    mi_scores = np.zeros(x_train.shape[1])
     for l in range(y_train.shape[1]):
         if y_train[:, l].sum() > 1:
             mi_scores += mutual_info_classif(
-                X_train, y_train[:, l], random_state=RANDOM_SEED
+                x_train, y_train[:, l], random_state=RANDOM_SEED
             )
     return np.argsort(mi_scores)[-n_select:]
 
 
-def tune_hyperparameters(X, y, n_folds=5, k_values=None, s_values=None):
+def tune_hyperparameters(x: np.ndarray, y: np.ndarray, n_folds: int = 5,
+                         k_values=None, s_values=None):
     """Grid-search ML-KNN hyperparameters with cross-validated F1."""
     if k_values is None:
         k_values = [3, 5, 8, 10, 12, 15, 20]
@@ -195,21 +217,21 @@ def tune_hyperparameters(X, y, n_folds=5, k_values=None, s_values=None):
     best_score = -1
     best_params = {"k": K_NEIGHBORS, "s": SMOOTHING_FACTOR}
 
-    n_splits = min(n_folds, len(X))
-    splits = list(_stratified_kfold_splits(n_splits, X, y, shuffle=True, random_state=RANDOM_SEED))
+    n_splits = min(n_folds, len(x))
+    splits = list(_stratified_kfold_splits(n_splits, x, y, shuffle=True, random_state=RANDOM_SEED))
 
     for k in k_values:
-        if k < 1 or k >= len(X) - 1:
+        if k < 1 or k >= len(x) - 1:
             continue
         for s in s_values:
             scores = []
             for train_idx, val_idx in splits:
-                X_tr, X_val = X[train_idx], X[val_idx]
+                x_tr, x_val = x[train_idx], x[val_idx]
                 y_tr, y_val = y[train_idx], y[val_idx]
 
                 model = MLKNN(k=k, s=s)
-                model.fit(X_tr, y_tr)
-                y_pred = model.predict(X_val)
+                model.fit(x_tr, y_tr)
+                y_pred = model.predict(x_val)
                 metrics = evaluate(y_val, y_pred)
                 scores.append(metrics["f1_score"])
 
@@ -229,29 +251,29 @@ def _load_labeled_data(dataset_name: str):
         return None
 
     data_npz = np.load(features_path, allow_pickle=True)
-    X = data_npz["X"]
+    x = data_npz["X"]
     y = data_npz["y"]
-    topics = data_npz["topics"]
+    topics = [str(t) for t in data_npz["topics"]]
     label_scores = data_npz.get("label_scores", None)
-    log.info(f"data · X={X.shape} y={y.shape} topics={len(topics)}")
+    log.info(f"data · x={x.shape} y={y.shape} topics={len(topics)}")
 
     labeled_mask = y.sum(axis=1) > 0
-    X_labeled = X[labeled_mask]
+    x_labeled = x[labeled_mask]
     y_labeled = y[labeled_mask]
     if label_scores is not None:
         label_scores = label_scores[labeled_mask]
 
-    if X_labeled.shape[0] < 20:
+    if x_labeled.shape[0] < 20:
         log.error("fewer than 20 labeled users")
         return None
 
     user_ids_all = data_npz["user_ids"]
     labeled_uids = [str(uid) for uid in user_ids_all[labeled_mask]]
 
-    return X_labeled, y_labeled, topics, label_scores, X.shape[0], labeled_uids
+    return x_labeled, y_labeled, topics, label_scores, x.shape[0], labeled_uids
 
 
-def _per_label_metrics(y_true, y_pred, topics):
+def _per_label_metrics(y_true: np.ndarray, y_pred: np.ndarray, topics: list[str]) -> dict[str, dict[str, float]]:
     """Compute per-label accuracy, precision, recall, f1."""
     result = {}
     for l, topic in enumerate(topics):
@@ -271,73 +293,101 @@ def _per_label_metrics(y_true, y_pred, topics):
     return result
 
 
+def _recompute_pagerank_features(
+    network,
+    labeled_uids: list[str],
+    train_idx: np.ndarray,
+    topics: list[str],
+    x_labeled: np.ndarray,
+) -> np.ndarray:
+    """Recompute PageRank-based relational features using current train fold."""
+    if network is None:
+        return x_labeled
+
+    train_uids = {labeled_uids[int(i)] for i in train_idx}
+    network.set_train_fold(train_uids)
+    network.compute_rs_scores()
+    new_user_rel, new_entity_rel = recompute_rel_features(network, labeled_uids, topics)
+    n_topics = len(topics)
+    ur_end = USER_REL_DIM * n_topics
+    er_end = ur_end + ENTITY_REL_DIM * n_topics
+    x_labeled_fixed = x_labeled.copy()
+    x_labeled_fixed[:, :ur_end] = new_user_rel
+    x_labeled_fixed[:, ur_end:er_end] = new_entity_rel
+    return x_labeled_fixed
+
+
+def _scale_and_select(
+    x_train: np.ndarray,
+    x_test: np.ndarray,
+    y_train: np.ndarray,
+    n_select: int = 80,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Scale features and select the top features by mutual information."""
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    x_test_scaled = scaler.transform(x_test)
+    selected = select_features_mi(x_train_scaled, y_train, n_select=n_select)
+    if len(selected) < x_train_scaled.shape[1]:
+        x_train_scaled = x_train_scaled[:, selected]
+        x_test_scaled = x_test_scaled[:, selected]
+    return x_train_scaled, x_test_scaled, selected
+
+
+def _save_results(results: dict, results_path: str) -> None:
+    """Serialize results to JSON and log the file path."""
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    log.info(f"file · {results_path}")
+
+
 def run_experiment(dataset_name: str):
     """Run train-test evaluation for a saved feature matrix."""
     log.info(f"▸ {dataset_name}")
-    t0 = time.time()
+    start_time = time.time()
 
     loaded = _load_labeled_data(dataset_name)
     if loaded is None:
         return None
-    X_labeled, y_labeled, topics, label_scores, n_users, labeled_uids = loaded
+    x_labeled, y_labeled, topics, label_scores, n_users, labeled_uids = loaded
 
-    idx_all = np.arange(X_labeled.shape[0])
-    try:
-        idx_train, idx_test = train_test_split(
-            idx_all, test_size=0.3, random_state=RANDOM_SEED,
-            stratify=_powerset_labels(y_labeled),
-        )
-    except ValueError:
-        idx_train, idx_test = train_test_split(
-            idx_all, test_size=0.3, random_state=RANDOM_SEED,
-        )
-    X_train, X_test = X_labeled[idx_train], X_labeled[idx_test]
+    idx_train, idx_test = _stratified_train_test_split(y_labeled)
+
+    x_train, x_test = x_labeled[idx_train], x_labeled[idx_test]
     y_train, y_test = y_labeled[idx_train], y_labeled[idx_test]
-    log.info(f"split · train={X_train.shape[0]} test={X_test.shape[0]}")
+    log.info(f"split · train={x_train.shape[0]} test={x_test.shape[0]}")
 
     # Recompute PageRank-based features using only training-fold seeds.
     net_path = os.path.join(DATA_DIR, f"{dataset_name}_network.pkl")
+    network = None
     if os.path.exists(net_path):
         with open(net_path, "rb") as f:
             network = pickle.load(f)
-        train_uids = {labeled_uids[i] for i in idx_train}
-        network.set_train_fold(train_uids)
-        network.compute_rs_scores()
-        new_user_rel, new_entity_rel = recompute_rel_features(network, labeled_uids, topics)
-        n_topics = len(topics)
-        ur_end = USER_REL_DIM * n_topics
-        er_end = ur_end + ENTITY_REL_DIM * n_topics
-        X_labeled_fixed = X_labeled.copy()
-        X_labeled_fixed[:, :ur_end] = new_user_rel
-        X_labeled_fixed[:, ur_end:er_end] = new_entity_rel
-        X_train = X_labeled_fixed[idx_train]
-        X_test = X_labeled_fixed[idx_test]
 
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    x_labeled = _recompute_pagerank_features(
+        network, labeled_uids, idx_train, topics, x_labeled
+    )
+    x_train = x_labeled[idx_train]
+    x_test = x_labeled[idx_test]
 
-    selected = select_features_mi(X_train, y_train, n_select=80)
-    if len(selected) < X_train.shape[1]:
-        X_train = X_train[:, selected]
-        X_test = X_test[:, selected]
-    log.info(f"features · selected={len(selected)}/{X_labeled.shape[1]}")
+    x_train, x_test, selected = _scale_and_select(x_train, x_test, y_train)
+    log.info(f"features · selected={len(selected)}/{x_labeled.shape[1]}")
 
     log.info("tuning …")
-    params = tune_hyperparameters(X_train, y_train)
+    params = tune_hyperparameters(x_train, y_train)
     log.info(f"params · k={params['k']} s={params['s']}")
 
     lc = None
     if label_scores is not None:
         lc = np.clip(label_scores[idx_train], 0.0, 1.0)
 
-    start_time = time.time()
+    fit_start = time.time()
     model = MLKNN(k=params['k'], s=params['s'])
-    model.fit(X_train, y_train, label_confidence=lc)
-    train_time = time.time() - start_time
+    model.fit(x_train, y_train, label_confidence=lc)
+    train_time = time.time() - fit_start
     log.info(f"training · {train_time:.1f}s")
 
-    y_pred = model.predict(X_test)
+    y_pred = model.predict(x_test)
 
     metrics = evaluate(y_test, y_pred)
     labels = {"hamming_loss": "hamming", "accuracy": "acc", "precision": "prec",
@@ -352,10 +402,10 @@ def run_experiment(dataset_name: str):
         "dataset": dataset_name,
         "topics": [str(t) for t in topics],
         "n_users": n_users,
-        "n_labeled": int(X_labeled.shape[0]),
-        "n_train": int(X_train.shape[0]),
-        "n_test": int(X_test.shape[0]),
-        "n_features": int(X_labeled.shape[1]),
+        "n_labeled": int(x_labeled.shape[0]),
+        "n_train": int(x_train.shape[0]),
+        "n_test": int(x_test.shape[0]),
+        "n_features": int(x_labeled.shape[1]),
         "best_k": params["k"],
         "best_s": params["s"],
         "train_time_s": train_time,
@@ -364,26 +414,24 @@ def run_experiment(dataset_name: str):
     }
 
     results_path = os.path.join(RESULTS_DIR, f"{dataset_name}_results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    log.info(f"file · {results_path}")
-    log.info(f"total · {time.time() - t0:.1f}s")
+    _save_results(results, results_path)
+    log.info(f"total · {time.time() - start_time:.1f}s")
 
     return metrics
 
 
 def run_nested_cv(dataset_name: str, n_outer: int = N_OUTER_CV,
-    n_inner: int = N_INNER_CV):
+                  n_inner: int = N_INNER_CV):
     """Run nested cross-validation and report mean ± std across outer folds."""
     log.info(f"▸ {dataset_name} (nested CV)")
-    t0 = time.time()
+    start_time = time.time()
 
     loaded = _load_labeled_data(dataset_name)
     if loaded is None:
         return None
-    X_labeled, y_labeled, topics, label_scores, n_users, labeled_uids = loaded
+    x_labeled, y_labeled, topics, label_scores, n_users, labeled_uids = loaded
 
-    n_samples = X_labeled.shape[0]
+    n_samples = x_labeled.shape[0]
     n_outer = min(n_outer, n_samples)
 
     # Load network once; rs_scores are recomputed per fold below.
@@ -398,44 +446,25 @@ def run_nested_cv(dataset_name: str, n_outer: int = N_OUTER_CV,
     fold_params = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(
-        _stratified_kfold_splits(n_outer, X_labeled, y_labeled, shuffle=True, random_state=RANDOM_SEED)
+        _stratified_kfold_splits(n_outer, x_labeled, y_labeled, shuffle=True, random_state=RANDOM_SEED)
     ):
-        X_tr, X_te = X_labeled[train_idx], X_labeled[test_idx]
+        x_labeled_fold = _recompute_pagerank_features(
+            network, labeled_uids, train_idx, topics, x_labeled
+        )
+        x_tr, x_te = x_labeled_fold[train_idx], x_labeled_fold[test_idx]
         y_tr, y_te = y_labeled[train_idx], y_labeled[test_idx]
 
-        # Recompute PageRank-based features for this fold.
-        if network is not None:
-            train_uids = {labeled_uids[i] for i in train_idx}
-            network.set_train_fold(train_uids)
-            network.compute_rs_scores()
-            new_user_rel, new_entity_rel = recompute_rel_features(network, labeled_uids, topics)
-            n_topics = len(topics)
-            ur_end = USER_REL_DIM * n_topics
-            er_end = ur_end + ENTITY_REL_DIM * n_topics
-            X_labeled_fixed = X_labeled.copy()
-            X_labeled_fixed[:, :ur_end] = new_user_rel
-            X_labeled_fixed[:, ur_end:er_end] = new_entity_rel
-            X_tr = X_labeled_fixed[train_idx]
-            X_te = X_labeled_fixed[test_idx]
+        x_tr, x_te, _ = _scale_and_select(x_tr, x_te, y_tr)
 
-        scaler = StandardScaler()
-        X_tr = scaler.fit_transform(X_tr)
-        X_te = scaler.transform(X_te)
-
-        selected = select_features_mi(X_tr, y_tr, n_select=80)
-        if len(selected) < X_tr.shape[1]:
-            X_tr = X_tr[:, selected]
-            X_te = X_te[:, selected]
-
-        params = tune_hyperparameters(X_tr, y_tr, n_folds=n_inner)
+        params = tune_hyperparameters(x_tr, y_tr, n_folds=n_inner)
 
         lc = None
         if label_scores is not None:
             lc = np.clip(label_scores[train_idx], 0.0, 1.0)
 
         model = MLKNN(k=params["k"], s=params["s"])
-        model.fit(X_tr, y_tr, label_confidence=lc)
-        y_pred = model.predict(X_te)
+        model.fit(x_tr, y_tr, label_confidence=lc)
+        y_pred = model.predict(x_te)
 
         metrics = evaluate(y_te, y_pred)
         fold_metrics.append(metrics)
@@ -443,7 +472,7 @@ def run_nested_cv(dataset_name: str, n_outer: int = N_OUTER_CV,
         fold_per_label.append(_per_label_metrics(y_te, y_pred, topics))
 
         log.info(f"fold {fold_idx + 1}/{n_outer} · "
-                 f"train={X_tr.shape[0]} test={X_te.shape[0]} "
+                 f"train={x_tr.shape[0]} test={x_te.shape[0]} "
                  f"k={params['k']} s={params['s']} "
                  f"f1={metrics['f1_score']:.4f}")
 
@@ -477,31 +506,29 @@ def run_nested_cv(dataset_name: str, n_outer: int = N_OUTER_CV,
         "dataset": dataset_name,
         "topics": [str(t) for t in topics],
         "n_users": n_users,
-        "n_labeled": int(X_labeled.shape[0]),
+        "n_labeled": int(x_labeled.shape[0]),
         "n_outer_folds": n_outer,
         "n_inner_folds": n_inner,
-        "n_features": int(X_labeled.shape[1]),
+        "n_features": int(x_labeled.shape[1]),
         "metrics": agg_metrics,
         "per_label": agg_per_label,
         "fold_params": fold_params,
-        "total_time_s": time.time() - t0,
+        "total_time_s": time.time() - start_time,
     }
 
     results_path = os.path.join(RESULTS_DIR, f"{dataset_name}_nested_cv_results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    log.info(f"file · {results_path}")
-    log.info(f"total · {time.time() - t0:.1f}s")
+    _save_results(results, results_path)
+    log.info(f"total · {time.time() - start_time:.1f}s")
 
     return agg_metrics
 
 
 if __name__ == "__main__":
-    t0 = time.time()
+    total_start = time.time()
     log.header()
     log.info("args · all")
-    for ds in ["dataset1", "dataset2"]:
+    for ds, _ in DATASETS:
         run_nested_cv(ds)
         run_experiment(ds)
-    log.ok(f"train complete · {time.time() - t0:.1f}s")
+    log.ok(f"train complete · {time.time() - total_start:.1f}s")
     log.blank()

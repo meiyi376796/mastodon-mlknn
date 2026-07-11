@@ -1,19 +1,16 @@
 """Construct heterogeneous user/entity networks from collected Mastodon data."""
 
+import math
 import os
 import pickle
-import math
 import time
 from collections import defaultdict
 from urllib.parse import urlparse
 
-import numpy as np
 import networkx as nx
+import numpy as np
 
-from config import (
-    DATA_DIR, DATASET1_TOPICS, DATASET2_TOPICS,
-    USER_REL_DIM, ENTITY_REL_DIM,
-)
+from config import DATA_DIR, DATASETS, USER_REL_DIM, ENTITY_REL_DIM
 from logger import Logger
 
 log = Logger("network")
@@ -50,6 +47,7 @@ class HeterogeneousNetwork:
 
         self.rs_scores: dict[str, dict[str, float]] = {}
         self.train_user_ids: set[str] | None = None
+        self._domain_entities_cache: dict[str, frozenset] = {}
 
         self._build()
 
@@ -130,7 +128,7 @@ class HeterogeneousNetwork:
                 log.warn(f"PageRank · {topic} · no valid seed indices skipping")
                 continue
 
-            t0 = time.time()
+            start_time = time.time()
             try:
                 pr = nx.pagerank(
                     self.graph, alpha=alpha,
@@ -146,7 +144,7 @@ class HeterogeneousNetwork:
                 if uid in self.user_to_idx:
                     idx = self.user_to_idx[uid]
                     self.rs_scores[topic][uid] = pr.get(idx, 0.0)
-            elapsed = time.time() - t0
+            elapsed = time.time() - start_time
             log.info(f"PageRank · {topic} · {elapsed:.1f}s")
 
     def get_user_rel_features(self, uid: str, topic: str) -> list[float]:
@@ -159,9 +157,11 @@ class HeterogeneousNetwork:
 
         all_scores = []
         for nb in set(self.graph.successors(ui)) | set(self.graph.predecessors(ui)):
+            if not isinstance(nb, int):
+                continue
             if self.graph.nodes[nb].get("type") != "user":
                 continue
-            nb_uid = self.idx_to_user.get(nb)
+            nb_uid: str | None = self.idx_to_user.get(nb)
             if nb_uid and nb_uid in rs_topic:
                 all_scores.append(rs_topic[nb_uid])
 
@@ -180,6 +180,15 @@ class HeterogeneousNetwork:
             float(np.var(scores)),
         ]
 
+    def _domain_entities_of(self, uid: str) -> frozenset:
+        """Return the domain entities of a user's posts, computed once and cached."""
+        if uid not in self._domain_entities_cache:
+            entities = _extract_entities(self.seed_posts.get(uid, []))
+            self._domain_entities_cache[uid] = frozenset(
+                e for e in entities if e.startswith("domain:")
+            )
+        return self._domain_entities_cache[uid]
+
     def get_entity_rel_features(self, uid: str, topic: str) -> list[float]:
         """Measure domain-entity overlap between a user's entities and topic seed entities."""
         if uid not in self.user_to_idx:
@@ -188,6 +197,8 @@ class HeterogeneousNetwork:
         ui = self.user_to_idx[uid]
         entity_neighbors = []
         for nb in self.graph.successors(ui):
+            if not isinstance(nb, int):
+                continue
             if self.graph.nodes[nb].get("type") == "entity":
                 ent_name = self.idx_to_entity.get(nb, "")
                 if ent_name.startswith("domain:"):
@@ -204,9 +215,7 @@ class HeterogeneousNetwork:
             if self.train_user_ids is not None and uid_s not in self.train_user_ids:
                 continue
             if uid_s in self.seed_posts:
-                for ent in _extract_entities(self.seed_posts[uid_s]):
-                    if ent.startswith("domain:"):
-                        topic_entities.add(ent)
+                topic_entities |= self._domain_entities_of(uid_s)
 
         overlap = len(set(entity_neighbors) & topic_entities)
         ratio = overlap / max(1, len(entity_neighbors))
@@ -225,7 +234,7 @@ class HeterogeneousNetwork:
 def build_network(data: dict, topics: list[str], dataset_name: str) -> HeterogeneousNetwork:
     """Build, score, and persist a heterogeneous network for one dataset."""
     log.info(f"▸ {dataset_name}")
-    t0 = time.time()
+    start_time = time.time()
     net = HeterogeneousNetwork(data, topics)
     log.info(f"nodes · {net.graph.number_of_nodes()}")
     log.info(f"edges · {net.graph.number_of_edges()}")
@@ -235,22 +244,27 @@ def build_network(data: dict, topics: list[str], dataset_name: str) -> Heterogen
     with open(path, "wb") as f:
         pickle.dump(net, f)
     log.info(f"file · {path}")
-    log.info(f"total · {time.time() - t0:.1f}s")
+    log.info(f"total · {time.time() - start_time:.1f}s")
 
     return net
 
 
+def _build_one_dataset(dataset_name: str, dataset_topics: list[str]) -> HeterogeneousNetwork | None:
+    """Load a pickled dataset and build its heterogeneous network."""
+    data_path = os.path.join(DATA_DIR, f"{dataset_name}.pkl")
+    if not os.path.exists(data_path):
+        log.skip(f"{data_path} not found")
+        return None
+    with open(data_path, "rb") as f:
+        loaded_data = pickle.load(f)
+    return build_network(loaded_data, dataset_topics, dataset_name)
+
+
 if __name__ == "__main__":
-    t0 = time.time()
+    total_start = time.time()
     log.header()
     log.info("args · all")
-    for ds, topics in [("dataset1", DATASET1_TOPICS), ("dataset2", DATASET2_TOPICS)]:
-        data_path = os.path.join(DATA_DIR, f"{ds}.pkl")
-        if not os.path.exists(data_path):
-            log.skip(f"{data_path} not found")
-            continue
-        with open(data_path, "rb") as f:
-            data = pickle.load(f)
-        build_network(data, topics, ds)
-    log.ok(f"network complete · {time.time() - t0:.1f}s")
+    for ds, topics in DATASETS:
+        _build_one_dataset(ds, topics)
+    log.ok(f"network complete · {time.time() - total_start:.1f}s")
     log.blank()

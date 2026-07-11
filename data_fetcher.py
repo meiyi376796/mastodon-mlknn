@@ -1,17 +1,17 @@
 """Fetch Mastodon data used to build the multi-label classification datasets."""
 
-import time
 import os
 import pickle
 import random
+import time
 from collections import defaultdict
-from typing import Optional
-
-import requests
+from typing import Any
 from urllib.parse import urlparse
 
+import requests
+
 from config import (
-    DATASET1_TOPICS, DATASET2_TOPICS,
+    DATASETS,
     SEED_USERS_PER_TOPIC, POSTS_PER_SEED,
     DATA_DIR, INSTANCES, RANDOM_SEED,
 )
@@ -54,12 +54,12 @@ def _build_profile(uid: str, account: dict, instance: str = "") -> dict:
 
 
 def _paginated_get(url: str, limit: int, page_size: int = 40,
-                   extra_params: Optional[dict] = None) -> list[dict]:
+                   extra_params: dict | None = None) -> list[dict]:
     """Read Mastodon paginated endpoints until the requested limit is reached."""
     all_items = []
-    max_id = None
+    max_id: str | None = None
     while len(all_items) < limit:
-        params = {"limit": min(page_size, limit - len(all_items))}
+        params: dict[str, Any] = {"limit": min(page_size, limit - len(all_items))}
         if extra_params:
             params.update(extra_params)
         if max_id:
@@ -76,7 +76,7 @@ def _paginated_get(url: str, limit: int, page_size: int = 40,
     return all_items[:limit]
 
 
-def _get(url: str, params: Optional[dict] = None, max_retries: int = 5):
+def _get(url: str, params: dict | None = None, max_retries: int = 5) -> Any:
     """Perform HTTP GET with bounded retry/backoff handling for public API collection."""
     last_error = None
     last_http_status = None
@@ -129,7 +129,7 @@ def get_account_statuses(instance: str, account_id: str, limit: int = 80) -> lis
                           extra_params={"exclude_replies": False, "exclude_reblogs": False})
 
 
-def get_account_by_acct(instance: str, acct: str) -> Optional[dict]:
+def get_account_by_acct(instance: str, acct: str) -> dict[str, Any] | list[Any]:
     """Look up a remote account on a given instance via WebFinger/acct."""
     url = f"{instance}/api/v1/accounts/lookup"
     return _get(url, {"acct": acct}, max_retries=2)
@@ -149,7 +149,7 @@ def _resolve_account(profile: dict) -> tuple[str, str]:
         return inst, raw_id
     for fallback in INSTANCES:
         looked_up = get_account_by_acct(fallback, acct)
-        if looked_up and looked_up.get("id"):
+        if isinstance(looked_up, dict) and looked_up.get("id"):
             profile["instance"] = fallback
             profile["raw_id"] = looked_up["id"]
             return fallback, looked_up["id"]
@@ -169,7 +169,7 @@ def _fetch_with_fallback(fetch_fn, profile: dict, *args, **kwargs):
         if fallback == inst:
             continue
         looked_up = get_account_by_acct(fallback, acct)
-        if looked_up and looked_up.get("id"):
+        if isinstance(looked_up, dict) and looked_up.get("id"):
             profile["instance"] = fallback
             profile["raw_id"] = looked_up["id"]
             result = fetch_fn(fallback, looked_up["id"], *args, **kwargs)
@@ -215,7 +215,7 @@ def _save_checkpoint(dataset_name, processed_seeds, processed_secondary,
         pickle.dump(data, f)
 
 
-def _load_checkpoint(dataset_name: str) -> Optional[dict]:
+def _load_checkpoint(dataset_name: str) -> dict | None:
     """Load progress markers; merge with full data if .pkl exists."""
     path = _checkpoint_path(dataset_name)
     if not os.path.exists(path):
@@ -223,7 +223,7 @@ def _load_checkpoint(dataset_name: str) -> Optional[dict]:
     try:
         with open(path, "rb") as f:
             progress = pickle.load(f)
-    except Exception:
+    except (OSError, EOFError, pickle.UnpicklingError):
         log.warn(f"checkpoint corrupted · discarding")
         os.remove(path)
         return None
@@ -245,7 +245,7 @@ def _final_data_path(dataset_name: str) -> str:
 def collect_data(topics: list[str], dataset_name: str) -> dict:
     """Collect seed users, posts, and relationship edges for a topic set with checkpoint resume."""
     log.info(f"▸ {dataset_name}")
-    t0 = time.time()
+    start_time = time.time()
 
     ckpt = _load_checkpoint(dataset_name)
     if ckpt:
@@ -445,7 +445,7 @@ def collect_data(topics: list[str], dataset_name: str) -> dict:
                     processed_seeds, processed_secondary,
                     topics_done, seed_phase_done, secondary_sample)
 
-    elapsed = time.time() - t0
+    elapsed = time.time() - start_time
     n_posts = len([u for u, p in seed_posts.items() if p])
     n_relations = sum(1 for r in relationships.values() if any(r.values()))
     log.info(f"users · {len(all_user_ids)}")
@@ -459,7 +459,7 @@ def collect_data(topics: list[str], dataset_name: str) -> dict:
             k: list(set(v)) for k, v in rels.items()
         }
 
-    data = {
+    data: dict[str, Any] = {
         "dataset_name": dataset_name,
         "topics": topics,
         "seed_users": dict(seed_users),
@@ -467,13 +467,12 @@ def collect_data(topics: list[str], dataset_name: str) -> dict:
         "user_ids": sorted(all_user_ids),
         "relationships": relationships_serializable,
         "user_profiles": user_profiles,
+        "_processed_seeds": list(processed_seeds),
+        "_processed_secondary": list(processed_secondary),
+        "_topics_done": list(topics_done),
+        "_seed_phase_done": seed_phase_done,
+        "_secondary_sample": secondary_sample,
     }
-
-    data["_processed_seeds"] = list(processed_seeds)
-    data["_processed_secondary"] = list(processed_secondary)
-    data["_topics_done"] = list(topics_done)
-    data["_seed_phase_done"] = seed_phase_done
-    data["_secondary_sample"] = secondary_sample
 
     path = _final_data_path(dataset_name)
     with open(path, "wb") as f:
@@ -484,10 +483,10 @@ def collect_data(topics: list[str], dataset_name: str) -> dict:
 
 
 if __name__ == "__main__":
-    t0 = time.time()
+    total_start = time.time()
     log.header()
     log.info("args · all")
-    collect_data(DATASET1_TOPICS, "dataset1")
-    collect_data(DATASET2_TOPICS, "dataset2")
-    log.ok(f"fetch complete · {time.time() - t0:.1f}s")
+    for ds, topics in DATASETS:
+        collect_data(topics, ds)
+    log.ok(f"fetch complete · {time.time() - total_start:.1f}s")
     log.blank()

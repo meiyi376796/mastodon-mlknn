@@ -13,6 +13,9 @@ INSTANCES = [
 DATASET1_TOPICS = ["politics", "technology", "economy"]
 DATASET2_TOPICS = ["economy", "education", "sports"]
 
+# (dataset name, topics) pairs shared by every pipeline stage.
+DATASETS = [("dataset1", DATASET1_TOPICS), ("dataset2", DATASET2_TOPICS)]
+
 # Data collection limits. Higher values improve coverage but increase API time.
 SEED_USERS_PER_TOPIC = 60
 POSTS_PER_SEED = 200
