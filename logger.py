@@ -46,11 +46,6 @@ class Logger:
     def ok(self, msg: str):
         self._emit(" ✓ ", _GREEN, msg)
 
-    def section(self, name: str):
-        rule = "─" * 40
-        print(f"\n{_DIM}{rule}{_RESET}", file=self._stream)
-        print(f"  {name}", file=self._stream)
-
     def header(self, name: str = "mastodon-mlknn"):
         rule = "─" * 40
         print(f"\n{_DIM}{rule}{_RESET}", file=self._stream)

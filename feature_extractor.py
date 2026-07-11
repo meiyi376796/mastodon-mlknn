@@ -1,19 +1,19 @@
 """Feature extraction for Mastodon multi-label user classification."""
 
+import math
 import os
 import pickle
-import math
-import time
 import re
+import time
 from collections import defaultdict
 from contextlib import redirect_stderr
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from config import (
-    DATA_DIR, DATASET1_TOPICS, DATASET2_TOPICS,
+    DATA_DIR, DATASETS,
     LDA_TOPICS, MIN_COMMUNITY_SIZE, RANDOM_SEED,
     GRAPH_EMB_DIM, PROFILE_DIM,
 )
@@ -66,14 +66,14 @@ def run_lda(user_texts: dict[str, str]) -> dict[str, np.ndarray]:
             user_topics[uid] = rng.dirichlet(np.ones(LDA_TOPICS))
         return user_topics
 
-    t0 = time.time()
+    start_time = time.time()
     vectorizer = TfidfVectorizer(
         max_features=5000, stop_words="english",
         min_df=2, max_df=0.9
     )
-    X = vectorizer.fit_transform(texts)
+    tfidf_matrix = vectorizer.fit_transform(texts)
 
-    if X.shape[1] == 0:
+    if tfidf_matrix.shape[1] == 0:
         log.warn(f"LDA vocabulary empty ({len(texts)})")
         rng = np.random.RandomState(RANDOM_SEED)
         user_topics = {}
@@ -82,7 +82,7 @@ def run_lda(user_texts: dict[str, str]) -> dict[str, np.ndarray]:
         return user_topics
 
     # Use the smaller of configured topics, corpus size, and vocabulary size.
-    n_topics = min(LDA_TOPICS, len(texts) // 2, X.shape[1])
+    n_topics = min(LDA_TOPICS, len(texts) // 2, tfidf_matrix.shape[1])
     n_topics = max(2, n_topics)
 
     lda = LatentDirichletAllocation(
@@ -91,7 +91,7 @@ def run_lda(user_texts: dict[str, str]) -> dict[str, np.ndarray]:
         random_state=RANDOM_SEED,
         max_iter=20,
     )
-    doc_topics = lda.fit_transform(X)
+    doc_topics = lda.fit_transform(tfidf_matrix)
 
     user_topics = {}
     for i, uid in enumerate(uids):
@@ -108,7 +108,7 @@ def run_lda(user_texts: dict[str, str]) -> dict[str, np.ndarray]:
             dist = padded
         user_topics[uid] = dist
 
-    log.info(f"LDA · {len(texts)} docs {n_topics} topics · {time.time() - t0:.1f}s")
+    log.info(f"LDA · {len(texts)} docs {n_topics} topics · {time.time() - start_time:.1f}s")
     return user_topics
 
 
@@ -192,7 +192,8 @@ def overlapping_community_detection(
 
     # Cache topic similarities once; the iterative loop reuses them repeatedly.
     similarities: dict[tuple, float] = {}
-    topic_vecs = {uid: user_topics.get(uid, np.ones(LDA_TOPICS) / LDA_TOPICS)
+    default_topic_vec = np.ones(LDA_TOPICS) / LDA_TOPICS
+    topic_vecs = {uid: user_topics.get(uid, default_topic_vec)
                   for uid in user_ids}
     for uid in user_ids:
         for v in user_neighbors.get(uid, set()):
@@ -200,12 +201,12 @@ def overlapping_community_detection(
                 continue
             key = (uid, v) if uid < v else (v, uid)
             if key not in similarities:
-                sim = cosine_similarity(topic_vecs[uid], topic_vecs[v])
+                sim = float(cosine_similarity(topic_vecs[uid], topic_vecs[v]))
                 similarities[key] = sim
 
-    def _get_sim(u, v):
-        key = (u, v) if u < v else (v, u)
-        return similarities.get(key, 0.0)
+    def _get_sim(u, other):
+        cache_key = (u, other) if u < other else (other, u)
+        return similarities.get(cache_key, 0.0)
 
     for iteration in range(max_iterations):
         changed = False
@@ -254,7 +255,7 @@ def overlapping_community_detection(
             if not new_labels:
                 continue
 
-            best_c = max(new_labels, key=new_labels.get)
+            best_c = max(new_labels, key=lambda k: new_labels[k])
             best_b = new_labels[best_c]
 
             old_labels = node_labels.get(uid, set())
@@ -324,7 +325,7 @@ def _compute_node2vec_embeddings(graph, user_to_idx: dict, n_users: int) -> np.n
     from node2vec import Node2Vec
 
     log.info(f"node2vec · dim={GRAPH_EMB_DIM} users={n_users}")
-    t0 = time.time()
+    start_time = time.time()
     n2v = Node2Vec(
         graph, dimensions=GRAPH_EMB_DIM, walk_length=20, num_walks=50,
         workers=1, quiet=True, seed=RANDOM_SEED,
@@ -338,11 +339,11 @@ def _compute_node2vec_embeddings(graph, user_to_idx: dict, n_users: int) -> np.n
         if key in model.wv:
             embeddings[idx, :] = model.wv[key]
 
-    log.info(f"node2vec · {time.time() - t0:.1f}s")
+    log.info(f"node2vec · {time.time() - start_time:.1f}s")
     return embeddings
 
 
-def recompute_rel_features(network, user_ids: list[str], topics: list[str]):
+def recompute_rel_features(network, user_ids: list[str], topics: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """Recompute user_rel and entity_rel feature blocks."""
     user_rel_features = []
     entity_rel_features = []
@@ -368,7 +369,7 @@ def extract_all_features(
     features are recomputed per CV fold in ml_knn.py.
     """
     log.info(f"▸ {dataset_name}")
-    t0 = time.time()
+    start_time = time.time()
 
     user_ids = list(data.get("user_ids", []))
     seed_posts = data.get("seed_posts", {})
@@ -386,19 +387,7 @@ def extract_all_features(
 
     comm_features = extract_community_features(community_labels, user_ids)
 
-    user_rel_features = []
-    entity_rel_features = []
-    for uid in user_ids:
-        user_feats = []
-        entity_feats = []
-        for topic in topics:
-            user_feats.extend(network.get_user_rel_features(uid, topic))
-            entity_feats.extend(network.get_entity_rel_features(uid, topic))
-        user_rel_features.append(user_feats)
-        entity_rel_features.append(entity_feats)
-
-    user_rel_arr = np.array(user_rel_features, dtype=np.float32)
-    entity_rel_arr = np.array(entity_rel_features, dtype=np.float32)
+    user_rel_arr, entity_rel_arr = recompute_rel_features(network, user_ids, topics)
 
     graph_emb = _compute_node2vec_embeddings(network.graph, network.user_to_idx, len(user_ids))
 
@@ -419,8 +408,10 @@ def extract_all_features(
             prof_arr[i, 2] = np.log1p(p.get("statuses_count", 0))
             prof_arr[i, 3] = np.log1p(p.get("following_count", 0) / max(1, p.get("followers_count", 1)))
 
-    X = np.hstack([user_rel_arr, entity_rel_arr, comm_features, lda_arr, prof_arr, graph_emb])
-    log.info(f"features · {X.shape[1]} user_rel={user_rel_arr.shape[1]} entity_rel={entity_rel_arr.shape[1]} comm={comm_features.shape[1]} lda={lda_arr.shape[1]} prof={prof_arr.shape[1]} emb={graph_emb.shape[1]}")
+    feature_matrix = np.hstack([user_rel_arr, entity_rel_arr, comm_features, lda_arr, prof_arr, graph_emb])
+    log.info(f"features · {feature_matrix.shape[1]} user_rel={user_rel_arr.shape[1]} "
+             f"entity_rel={entity_rel_arr.shape[1]} comm={comm_features.shape[1]} "
+             f"lda={lda_arr.shape[1]} prof={prof_arr.shape[1]} emb={graph_emb.shape[1]}")
 
     # Labels are weak supervision generated from seed membership and observed hashtags.
     # They are not manually verified ground-truth labels.
@@ -487,20 +478,20 @@ def extract_all_features(
     log.info(f"labels · {label_dist}")
 
     features_path = os.path.join(DATA_DIR, f"{dataset_name}_features.npz")
-    np.savez(features_path, X=X, y=y, label_scores=label_scores,
+    np.savez(features_path, X=feature_matrix, y=y, label_scores=label_scores,
              user_ids=np.array(user_ids), topics=topics, lda_dim=lda_dim,
              n_topics=len(topics))
     log.info(f"file · {features_path}")
-    log.info(f"total · {time.time() - t0:.1f}s")
+    log.info(f"total · {time.time() - start_time:.1f}s")
 
-    return X, y, user_ids
+    return feature_matrix, y, user_ids
 
 
 if __name__ == "__main__":
-    t0 = time.time()
+    total_start = time.time()
     log.header()
     log.info("args · all")
-    for ds, topics in [("dataset1", DATASET1_TOPICS), ("dataset2", DATASET2_TOPICS)]:
+    for ds, topics in DATASETS:
         data_path = os.path.join(DATA_DIR, f"{ds}.pkl")
         net_path = os.path.join(DATA_DIR, f"{ds}_network.pkl")
         if not os.path.exists(data_path) or not os.path.exists(net_path):
@@ -508,10 +499,10 @@ if __name__ == "__main__":
             continue
 
         with open(data_path, "rb") as f:
-            data = pickle.load(f)
+            loaded_data = pickle.load(f)
         with open(net_path, "rb") as f:
-            network = pickle.load(f)
+            loaded_network = pickle.load(f)
 
-        extract_all_features(data, network, topics, ds)
-    log.ok(f"features complete · {time.time() - t0:.1f}s")
+        extract_all_features(loaded_data, loaded_network, topics, ds)
+    log.ok(f"features complete · {time.time() - total_start:.1f}s")
     log.blank()

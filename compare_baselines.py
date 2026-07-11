@@ -1,35 +1,30 @@
 """Compare the proposed feature set against SVM and network-community baselines."""
 
-import os
 import json
-import time
+import os
 import pickle
+import time
 
 import networkx as nx
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from config import (
-    DATA_DIR, RESULTS_DIR, RANDOM_SEED,
+    DATA_DIR, RESULTS_DIR, RANDOM_SEED, DATASETS,
     USER_REL_DIM, ENTITY_REL_DIM, LDA_TOPICS, GRAPH_EMB_DIM, PROFILE_DIM,
 )
 from ml_knn import (
     MLKNN, evaluate, select_features_mi, tune_hyperparameters,
-    _powerset_labels, _stratified_kfold_splits,
+    _stratified_kfold_splits, _recompute_pagerank_features,
+    _stratified_train_test_split,
 )
-from feature_extractor import recompute_rel_features
 from logger import Logger
 
 log = Logger("compare")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
-
-def comparison_metrics(y_true, y_pred):
-    """Compute multi-label metrics with sample-based averaging."""
-    return evaluate(y_true, y_pred)
 
 
 class BinaryRelevanceSVM:
@@ -41,7 +36,7 @@ class BinaryRelevanceSVM:
         self.class_weight = class_weight
         self.clfs = []
 
-    def fit(self, X, y):
+    def fit(self, features, y):
         self.clfs = []
         for l in range(y.shape[1]):
             classes = np.unique(y[:, l])
@@ -50,15 +45,15 @@ class BinaryRelevanceSVM:
                 self.clfs.append(int(classes[0]))
                 continue
             clf = SVC(kernel=self.kernel, C=self.C, class_weight=self.class_weight, random_state=RANDOM_SEED)
-            self.clfs.append(clf.fit(X, y[:, l]))
+            self.clfs.append(clf.fit(features, y[:, l]))
 
-    def predict(self, X):
+    def predict(self, features):
         preds = []
         for clf in self.clfs:
             if isinstance(clf, int):
-                preds.append(np.full(X.shape[0], clf, dtype=np.int32))
+                preds.append(np.full(features.shape[0], clf, dtype=np.int32))
             else:
-                preds.append(clf.predict(X).astype(np.int32))
+                preds.append(clf.predict(features).astype(np.int32))
         return np.column_stack(preds).astype(np.int32)
 
 
@@ -71,19 +66,19 @@ class LabelPowersetSVM:
         self._combo_to_class = {}
         self._class_to_combo = {}
 
-    def fit(self, X, y):
+    def fit(self, features, y):
         y_int = y.astype(np.int32)
         combos = sorted(set(tuple(row) for row in y_int))
         self._combo_to_class = {c: i for i, c in enumerate(combos)}
         self._class_to_combo = {i: np.array(c, dtype=np.int32) for i, c in enumerate(combos)}
         y_class = np.array([self._combo_to_class[tuple(row)] for row in y_int])
         self.clf = SVC(kernel="rbf", C=self.C, random_state=RANDOM_SEED)
-        self.clf.fit(X, y_class)
+        self.clf.fit(features, y_class)
 
-    def predict(self, X):
-        y_class = self.clf.predict(X).astype(np.int32)
+    def predict(self, features):
+        y_class = self.clf.predict(features).astype(np.int32)
         n_labels = len(next(iter(self._class_to_combo.values())))
-        y_pred = np.zeros((X.shape[0], n_labels), dtype=np.int32)
+        y_pred = np.zeros((features.shape[0], n_labels), dtype=np.int32)
         for i, c in enumerate(y_class):
             if c in self._class_to_combo:
                 y_pred[i] = self._class_to_combo[c]
@@ -213,22 +208,22 @@ def build_edgecluster_features(network, user_ids, n_clusters=None):
     }
 
 
-def tune_svm(cls, X, y, n_folds=3, c_values=None, **kw):
+def tune_svm(cls, features, y, n_folds=3, c_values=None, **kw):
     """Cross-validate the SVM regularization parameter for a baseline class."""
     if c_values is None:
         c_values = [0.1, 1.0, 10.0]
 
     best_c = c_values[0]
     best_f1 = -1.0
-    n_splits = min(n_folds, len(X))
-    splits = list(_stratified_kfold_splits(n_splits, X, y, shuffle=True, random_state=RANDOM_SEED))
+    n_splits = min(n_folds, len(features))
+    splits = list(_stratified_kfold_splits(n_splits, features, y, shuffle=True, random_state=RANDOM_SEED))
 
     for c in c_values:
         scores = []
         for tr_idx, val_idx in splits:
             m = cls(C=c, **kw)
-            m.fit(X[tr_idx], y[tr_idx])
-            yp = m.predict(X[val_idx])
+            m.fit(features[tr_idx], y[tr_idx])
+            yp = m.predict(features[val_idx])
             scores.append(evaluate(y[val_idx], yp)["f1_score"])
         avg_f1 = np.mean(scores)
         if avg_f1 > best_f1:
@@ -241,7 +236,7 @@ def tune_svm(cls, X, y, n_folds=3, c_values=None, **kw):
 def run(dataset_name):
     """Run all baseline models and write a comparison JSON report."""
     log.info(f"▸ {dataset_name}")
-    t0 = time.time()
+    start_time = time.time()
 
     fpath = os.path.join(DATA_DIR, f"{dataset_name}_features.npz")
     npath = os.path.join(DATA_DIR, f"{dataset_name}_network.pkl")
@@ -250,13 +245,13 @@ def run(dataset_name):
         return
 
     data_npz = np.load(fpath, allow_pickle=True)
-    Xf, yf = data_npz["X"], data_npz["y"]
-    label_scores = data_npz.get("label_scores", None)
+    features_full, y_full = data_npz["X"], data_npz["y"]
+    label_scores: np.ndarray | None = data_npz.get("label_scores", None)
     user_ids = [str(uid) for uid in data_npz["user_ids"]]
-    mask = yf.sum(1) > 0
-    X, y = Xf[mask], yf[mask]
-    ls = label_scores[mask] if label_scores is not None else None
-    log.info(f"data · X={X.shape} samples={len(y)} positives={y.sum()} labels={y.shape[1]}")
+    mask = y_full.sum(1) > 0
+    features, y = features_full[mask], y_full[mask]
+    ls: np.ndarray | None = label_scores[mask] if label_scores is not None else None
+    log.info(f"data · features={features.shape} samples={len(y)} positives={y.sum()} labels={y.shape[1]}")
 
     if len(y) < 20:
         log.warn(f"{dataset_name} · too few labeled samples ({len(y)}), will skip")
@@ -270,121 +265,108 @@ def run(dataset_name):
 
     log.info(f"network · nodes={network.graph.number_of_nodes()} edges={network.graph.number_of_edges()}")
 
-    try:
-        train_idx, test_idx = train_test_split(
-            np.arange(len(y)),
-            test_size=0.3,
-            random_state=RANDOM_SEED,
-            stratify=_powerset_labels(y),
-        )
-    except ValueError:
-        train_idx, test_idx = train_test_split(
-            np.arange(len(y)),
-            test_size=0.3,
-            random_state=RANDOM_SEED,
-        )
+    train_idx, test_idx = _stratified_train_test_split(y)
     ytr, yte = y[train_idx], y[test_idx]
 
     # Recompute PageRank-based features using only training-fold seeds.
     labeled_uids = [user_ids[i] for i in range(len(user_ids)) if mask[i]]
-    train_uids = {labeled_uids[i] for i in train_idx}
-    network.set_train_fold(train_uids)
-    network.compute_rs_scores()
-    n_topics = y.shape[1]
     topics_list = [str(t) for t in data_npz["topics"]]
-    new_user_rel, new_entity_rel = recompute_rel_features(network, labeled_uids, topics_list)
-    ur_end = USER_REL_DIM * n_topics
-    er_end = ur_end + ENTITY_REL_DIM * n_topics
-    X_fixed = X.copy()
-    X_fixed[:, :ur_end] = new_user_rel
-    X_fixed[:, ur_end:er_end] = new_entity_rel
-    X = X_fixed
+    features = _recompute_pagerank_features(network, labeled_uids, train_idx, topics_list, features)
 
-    def split_scale(features):
+    def split_scale(feat):
         scaler = StandardScaler()
-        return scaler.fit_transform(features[train_idx]), scaler.transform(features[test_idx])
+        return scaler.fit_transform(feat[train_idx]), scaler.transform(feat[test_idx])
 
-    Xtr, Xte = split_scale(X)
-    selected = select_features_mi(Xtr, ytr, n_select=80)
-    if len(selected) < Xtr.shape[1]:
-        Xtr, Xte = Xtr[:, selected], Xte[:, selected]
+    x_train, x_test = split_scale(features)
+    selected = select_features_mi(x_train, ytr, n_select=80)
+    if len(selected) < x_train.shape[1]:
+        x_train, x_test = x_train[:, selected], x_test[:, selected]
 
     n_topics = y.shape[1]
     lda_dim = int(data_npz.get("lda_dim", LDA_TOPICS))
     simple_leading = (USER_REL_DIM + ENTITY_REL_DIM) * n_topics
     simple_trailing = GRAPH_EMB_DIM + PROFILE_DIM + lda_dim
     # The "simple" baselines exclude community and graph-embedding features.
-    X_simple = np.hstack([X[:, :simple_leading], X[:, -simple_trailing:-GRAPH_EMB_DIM]])
-    Xstr, Xste = split_scale(X_simple)
+    x_simple = np.hstack([features[:, :simple_leading], features[:, -simple_trailing:-GRAPH_EMB_DIM]])
+    x_simple_train, x_simple_test = split_scale(x_simple)
 
-    Xc_full, mroc_meta = build_mroc_features(network, user_ids)
-    Xc = Xc_full[mask]
-    Xctr, Xcte = split_scale(Xc)
+    x_comm_full, mroc_meta = build_mroc_features(network, user_ids)
+    x_comm = x_comm_full[mask]
+    x_comm_train, x_comm_test = split_scale(x_comm)
     log.info(f"MROC · communities={mroc_meta['n_communities']} edges={mroc_meta['n_topology_edges']}")
 
-    Xe_full, edge_meta = build_edgecluster_features(network, user_ids)
-    Xe = Xe_full[mask]
-    Xetr, Xete = split_scale(Xe)
+    x_edge_full, edge_meta = build_edgecluster_features(network, user_ids)
+    x_edge = x_edge_full[mask]
+    x_edge_train, x_edge_test = split_scale(x_edge)
     log.info(f"EdgeCluster · clusters={edge_meta['n_edge_clusters']} edges={edge_meta['n_topology_edges']}")
 
     results = {}
 
     log.info("MLUCHNCD · training …")
-    params = tune_hyperparameters(Xtr, ytr, n_folds=3, k_values=[3, 5, 8, 10], s_values=[0.5, 1.0])
+    params = tune_hyperparameters(x_train, ytr, n_folds=3, k_values=[3, 5, 8, 10], s_values=[0.5, 1.0])
     k, s = params["k"], params["s"]
     t_start = time.time()
     m = MLKNN(k=k, s=s)
-    lc = np.clip(ls[train_idx], 0.0, 1.0) if ls is not None else None
-    m.fit(Xtr, ytr, label_confidence=lc)
-    yp_ml = m.predict(Xte)
+    if ls is not None:
+        lc = np.clip(ls[train_idx], 0.0, 1.0)
+    else:
+        lc = None
+    m.fit(x_train, ytr, label_confidence=lc)
+    yp_ml = m.predict(x_test)
     results["MLUCHNCD"] = {
-        **comparison_metrics(yte, yp_ml),
+        **evaluate(yte, yp_ml),
         "train_s": time.time() - t_start,
         "k": k,
         "s": s,
     }
 
     log.info("BR · training …")
-    c_br = tune_svm(BinaryRelevanceSVM, Xstr, ytr)
+    c_br = tune_svm(BinaryRelevanceSVM, x_simple_train, ytr)
     t_start = time.time()
     m = BinaryRelevanceSVM(C=c_br)
-    m.fit(Xstr, ytr)
+    m.fit(x_simple_train, ytr)
     results["BR"] = {
-        **comparison_metrics(yte, m.predict(Xste)),
+        **evaluate(yte, m.predict(x_simple_test)),
         "train_s": time.time() - t_start,
         "C": c_br,
     }
 
     log.info("LP · training …")
-    c_lp = tune_svm(LabelPowersetSVM, Xstr, ytr)
+    c_lp = tune_svm(LabelPowersetSVM, x_simple_train, ytr)
     t_start = time.time()
     m = LabelPowersetSVM(C=c_lp)
-    m.fit(Xstr, ytr)
+    m.fit(x_simple_train, ytr)
     results["LP"] = {
-        **comparison_metrics(yte, m.predict(Xste)),
+        **evaluate(yte, m.predict(x_simple_test)),
         "train_s": time.time() - t_start,
         "C": c_lp,
     }
 
     log.info("MROC · training …")
-    c_mroc = tune_svm(BinaryRelevanceSVM, Xctr, ytr, c_values=[0.01, 0.1, 1.0, 10.0], kernel="linear", class_weight="balanced")
+    c_mroc = tune_svm(
+        BinaryRelevanceSVM, x_comm_train, ytr,
+        c_values=[0.01, 0.1, 1.0, 10.0], kernel="linear", class_weight="balanced",
+    )
     t_start = time.time()
     m = BinaryRelevanceSVM(C=c_mroc, kernel="linear", class_weight="balanced")
-    m.fit(Xctr, ytr)
+    m.fit(x_comm_train, ytr)
     results["MROC"] = {
-        **comparison_metrics(yte, m.predict(Xcte)),
+        **evaluate(yte, m.predict(x_comm_test)),
         "train_s": time.time() - t_start,
         "C": c_mroc,
         **mroc_meta,
     }
 
     log.info("EdgeCluster · training …")
-    c_ec = tune_svm(BinaryRelevanceSVM, Xetr, ytr, c_values=[0.01, 0.1, 1.0, 10.0], kernel="linear", class_weight="balanced")
+    c_ec = tune_svm(
+        BinaryRelevanceSVM, x_edge_train, ytr,
+        c_values=[0.01, 0.1, 1.0, 10.0], kernel="linear", class_weight="balanced",
+    )
     t_start = time.time()
     m = BinaryRelevanceSVM(C=c_ec, kernel="linear", class_weight="balanced")
-    m.fit(Xetr, ytr)
+    m.fit(x_edge_train, ytr)
     results["EdgeCluster"] = {
-        **comparison_metrics(yte, m.predict(Xete)),
+        **evaluate(yte, m.predict(x_edge_test)),
         "train_s": time.time() - t_start,
         "C": c_ec,
         **edge_meta,
@@ -397,14 +379,14 @@ def run(dataset_name):
     with open(sp, "w") as f:
         json.dump(results, f, indent=2)
     log.info(f"file · {sp}")
-    log.info(f"total · {time.time() - t0:.1f}s")
+    log.info(f"total · {time.time() - start_time:.1f}s")
 
 
 if __name__ == "__main__":
-    t0 = time.time()
+    total_start = time.time()
     log.header()
     log.info("args · all")
-    run("dataset1")
-    run("dataset2")
-    log.ok(f"compare complete · {time.time() - t0:.1f}s")
+    for ds, _ in DATASETS:
+        run(ds)
+    log.ok(f"compare complete · {time.time() - total_start:.1f}s")
     log.blank()
