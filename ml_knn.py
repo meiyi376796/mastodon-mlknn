@@ -29,6 +29,9 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+METRIC_LABELS = {"hamming_loss": "hamming", "accuracy": "acc", "precision": "prec",
+                 "recall": "rec", "f1_score": "f1"}
+
 
 def _powerset_labels(y: np.ndarray) -> np.ndarray:
     """Encode multi-label rows as integer powerset labels for stratification."""
@@ -390,10 +393,8 @@ def run_experiment(dataset_name: str):
     y_pred = model.predict(x_test)
 
     metrics = evaluate(y_test, y_pred)
-    labels = {"hamming_loss": "hamming", "accuracy": "acc", "precision": "prec",
-              "recall": "rec", "f1_score": "f1"}
     for name in METRIC_ORDER:
-        label = labels[name]
+        label = METRIC_LABELS[name]
         log.info(f"{label} · {metrics[name]:.4f}")
 
     per_label = _per_label_metrics(y_test, y_pred, topics)
@@ -494,12 +495,10 @@ def run_nested_cv(dataset_name: str, n_outer: int = N_OUTER_CV,
                 "std": float(np.std(values, ddof=1)),
             }
 
-    labels = {"hamming_loss": "hamming", "accuracy": "acc", "precision": "prec",
-              "recall": "rec", "f1_score": "f1"}
     parts = []
     for name in METRIC_ORDER:
         entry = agg_metrics[name]
-        parts.append(f"{labels[name]}={entry['mean']:.4f}±{entry['std']:.4f}")
+        parts.append(f"{METRIC_LABELS[name]}={entry['mean']:.4f}±{entry['std']:.4f}")
     log.info(f"nested CV · {' '.join(parts)}")
 
     results = {
